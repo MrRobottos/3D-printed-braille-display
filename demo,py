@@ -1,0 +1,212 @@
+# demo_all_in_one.py
+# One script demo:
+# - Button A toggles "smart bulb" (LED) and rotates Stepper A +90°
+# - Tuya lock status is polled; when OPEN/CLOSED changes, rotate Stepper B +90°
+# - Button B forces an immediate lock status refresh (handy during demo)
+
+import time
+import threading
+import RPi.GPIO as GPIO
+from gpiozero import Button, LED
+import os
+from dotenv import load_dotenv
+
+# Pins for Stepper A (bulb prism) - ULN2003 A
+A_PINS = [17, 18, 27, 22]   # IN1..IN4
+
+# Pins for Stepper B (lock prism) - ULN2003 B
+B_PINS = [23, 24, 25, 12]   # IN1..IN4
+
+# Buttons
+BUTTON_A_PIN = 4   # bulb toggle
+BUTTON_B_PIN = 6   # lock refresh
+
+# LED for bulb
+LED_PIN = 5
+
+# ========== TUYA (LOCK) CONFIG ==========
+
+
+# Load .env sitting next to the script (or in project root)
+load_dotenv()   # loads from .env into process env
+
+# Read config with sensible defaults / type-casting
+ACCESS_ID      = os.getenv("TUYA_ACCESS_ID")
+ACCESS_SECRET  = os.getenv("TUYA_ACCESS_SECRET")
+ENDPOINT       = os.getenv("TUYA_ENDPOINT", "https://openapi.tuyaeu.com")
+SCHEMA         = os.getenv("TUYA_SCHEMA", "smartlife")
+USERNAME       = os.getenv("TUYA_USERNAME")
+PASSWORD       = os.getenv("TUYA_PASSWORD")
+COUNTRY_CODE   = os.getenv("TUYA_COUNTRY_CODE", "27")
+
+LOCK_DEVICE_ID = os.getenv("TUYA_LOCK_DEVICE_ID")
+BULB_DEVICE_ID = os.getenv("TUYA_BULB_DEVICE_ID")  # if/when you control the bulb
+
+# Optional app-level tuning from env
+try:
+    POLL_PERIOD_S = float(os.getenv("POLL_PERIOD_S", "1.0"))
+    STEPS_90      = int(os.getenv("STEPS_90", "1024"))
+    STEP_DELAY    = float(os.getenv("STEP_DELAY", "0.0028"))
+except ValueError:
+    # fall back to safe defaults if someone puts bad values in .env
+    POLL_PERIOD_S = 1.0
+    STEPS_90      = 1024
+    STEP_DELAY    = 0.0028
+
+# Fail fast if critical secrets are missing (clear error for teammates)
+_missing = [k for k in ["TUYA_ACCESS_ID","TUYA_ACCESS_SECRET","TUYA_USERNAME","TUYA_PASSWORD","TUYA_COUNTRY_CODE","TUYA_SCHEMA"] if not os.getenv(k)]
+if _missing:
+    raise RuntimeError(f"Missing required env vars: {', '.join(_missing)}. "
+                       "Copy .env.example to .env and fill in your values.")
+
+
+# ========================================
+
+SEQ = [
+    [1,0,0,0],
+    [1,1,0,0],
+    [0,1,0,0],
+    [0,1,1,0],
+    [0,0,1,0],
+    [0,0,1,1],
+    [0,0,0,1],
+    [1,0,0,1],
+]
+
+def setup_outputs(pins):
+    for p in pins:
+        GPIO.setup(p, GPIO.OUT)
+        GPIO.output(p, 0)
+
+def release(pins):
+    for p in pins:
+        GPIO.output(p, 0)
+
+class HalfStepper:
+    def __init__(self, pins, delay=0.003):
+        self.pins = pins
+        self.delay = delay
+        self.idx = 0
+        self._lock = threading.Lock()
+        setup_outputs(self.pins)
+
+    def _phase(self, pattern):
+        for pin, val in zip(self.pins, pattern):
+            GPIO.output(pin, val)
+
+    def step_n(self, n):
+        # always forward (positive n); if negative passed, still forward
+        steps = abs(int(n))
+        with self._lock:
+            for _ in range(steps):
+                self.idx = (self.idx + 1) % 8
+                self._phase(SEQ[self.idx])
+                time.sleep(self.delay)
+            # optional: de-energize coils
+            release(self.pins)
+
+# ----- GPIO base setup -----
+GPIO.setmode(GPIO.BCM)
+# LED + Buttons
+led = LED(LED_PIN)
+btn_a = Button(BUTTON_A_PIN, pull_up=True, bounce_time=0.15)
+btn_b = Button(BUTTON_B_PIN, pull_up=True, bounce_time=0.15)
+
+# Two independent steppers
+stepperA = HalfStepper(A_PINS, delay=STEP_DELAY)
+stepperB = HalfStepper(B_PINS, delay=STEP_DELAY)
+
+# ----- Bulb state -----
+bulb_on = False
+def toggle_bulb():
+    global bulb_on
+    bulb_on = not bulb_on
+    if bulb_on:
+        led.on()
+        print("[BULB] ON")
+    else:
+        led.off()
+        print("[BULB] OFF")
+    print("[BULB] Rotate prism +90°")
+    stepperA.step_n(STEPS_90)
+
+# Bind Button A
+btn_a.when_pressed = toggle_bulb
+
+# ----- Tuya (lock) integration -----
+lock_last_state = None         # "OPEN"/"CLOSED"
+force_refresh = False          # set by Button B
+
+def tuya_thread():
+    if not USE_TUYA:
+        print("[LOCK] Tuya disabled; skipping cloud.")
+        return
+
+    # Lazy import so the script runs even if tuya_iot isn't installed
+    from tuya_iot import TuyaOpenAPI
+
+    global lock_last_state, force_refresh
+
+    print("[LOCK] Connecting to Tuya…")
+    api = TuyaOpenAPI(ENDPOINT, ACCESS_ID, ACCESS_SECRET)
+    api.connect(USERNAME, PASSWORD, COUNTRY_CODE, SCHEMA)
+    print("[LOCK] Connected.")
+
+    def read_state():
+        res = api.get(f"/v1.0/devices/{LOCK_DEVICE_ID}/status")
+        if not res.get("success"):
+            print("[LOCK] Status read failed:", res)
+            return None
+        d = {x["code"]: x["value"] for x in res["result"]}
+        # Prefer closed_opened if present
+        if "closed_opened" in d:
+            s = "CLOSED" if d["closed_opened"] == "closed" else "OPEN"
+            return s
+        if "lock_motor_state" in d:
+            s = "CLOSED" if d["lock_motor_state"] else "OPEN"
+            return s
+        return None
+
+    while True:
+        state = read_state()
+        if state is not None:
+            # Debounce: only act on change
+            if state != lock_last_state:
+                print(f"[LOCK] State → {state} (rotate prism +90°)")
+                stepperB.step_n(STEPS_90)
+                lock_last_state = state
+        else:
+            print("[LOCK] Unknown state; no movement.")
+        # handle Button B "force refresh" (just short-circuits the sleep)
+        for _ in range(int(POLL_PERIOD_S * 10)):
+            if force_refresh:
+                force_refresh = False
+                break
+            time.sleep(0.1)
+
+def button_b_action():
+    # force a poll ASAP (useful in demo after you change the lock with the phone)
+    global force_refresh
+    force_refresh = True
+    print("[LOCK] Refresh requested")
+
+btn_b.when_pressed = button_b_action
+
+# ----- Main -----
+print("=== Braille Smart Device Demo ===")
+print("Button A: toggle bulb + rotate Stepper A (+90°)")
+print("Button B: force lock status refresh (lock prism rotates on status change)")
+print("Lock prism will advance +90° each time the real lock changes OPEN/CLOSED.")
+
+try:
+    t = threading.Thread(target=tuya_thread, daemon=True)
+    t.start()
+    while True:
+        time.sleep(0.2)
+except KeyboardInterrupt:
+    pass
+finally:
+    release(A_PINS)
+    release(B_PINS)
+    GPIO.cleanup()
+    print("\nClean exit.")
